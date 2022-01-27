@@ -1,0 +1,2029 @@
+---
+title: "QTL Imputation Methods"
+author: "Zachary Winn"
+date: "8/26/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This is the script to predict scab QTL using the data from the SunGrains program. 
+
+```{r}
+#clear environment
+rm(list = ls())
+#set working directory
+setwd(paste("C:/Users/", 
+            Sys.getenv("USERNAME"),
+            "/OneDrive/North Carolina State University/Dissertation/Marker Predictions Using GBS Data/Machine Learning Marker Prediction", 
+            sep=""))
+```
+
+# Running GWAS in Scab Nursery
+
+Here I run a couple genome wide association studies to find what MTAs are present in the total Scab Nursery, and compare their position to those FHB QTL we are identifying with KASP assays.  
+
+## Read in Data and Format for GWAS
+
+Here, we read in the data and manipulate it to do GWAS in rrBLUP. The following happens in this script:  
+
+1. Read in the phenotypic and genotypic data  
+2. Run mixed linear models for the FHB traits in question and pull BLUEs for the fixed genotype effect  
+3. Merge phenotypic BLUEs with list of available GBS data, drop those individuals that do not occur in the GBS data
+
+### Read in Geno and Pheno File
+
+```{r}
+#library
+library(tidyverse)
+
+#read in marker data
+genotype <- read.csv(file = "SG_May21_6392taxa_21324snp_012coding_060121.csv", 
+                     header = T, 
+                     row.names = 1, 
+                     check.names = F) 
+
+#check
+genotype[1:5, 1:2]
+
+#transpose
+genotype <- t(genotype) 
+
+#change to -1, 0, 1 coding
+genotype <- genotype - 1 
+
+#check
+genotype[1:10,1:10] 
+
+#read in SNP info
+snp_info <- read.csv(file = "SG_May21_snppos_21324snp.csv", 
+                     check.names = F, 
+                     header = T, 
+                     sep = ",", 
+                     stringsAsFactors = F)
+#check
+snp_info[1:3,]
+
+#rename
+colnames(snp_info)[1] <- "marker"
+
+#create genotype file for rrBLUP
+Mt <- as.data.frame(t(genotype))
+Mt[1:5, 1:5]
+Mt <- rownames_to_column(Mt, "marker")
+geno <- Reduce(function(...) merge(..., by='marker', all=TRUE), list(snp_info, Mt))
+geno[1:10,1:4]
+
+#read in phenotype file
+Pheno_FHB <-as.data.frame(read.csv(file="FHB_all_2011-2020_withQTL_120120.csv", 
+                                   header=T, 
+                                   sep=",", 
+                                   check.names=F))
+
+#create reference between genotype and phenotype
+var_ref<-data.frame(FullSampleName=colnames(geno)[4:ncol(geno)])
+var_ref<-var_ref
+var_ref$FullSampleName <- gsub("_", "-", var_ref$FullSampleName) 
+var_ref$FullSampleName <- toupper(var_ref$FullSampleName) 
+
+#I need to parse these names for matching with the marker report
+var_ref <- var_ref %>% 
+  mutate(VarCode = FullSampleName) %>% 
+  separate(., VarCode, into = c("Nursery_Code", "LibPrepID", "Name"), sep = ":", extra = "merge")
+var_ref<- separate(var_ref, Name, into = c("GSID", "Genotype"), sep = ":", extra = "drop", fill = "left")
+
+#remove all dashes, underscores, etc from the names in order to control for variation in the formatting
+var_ref <- var_ref %>% 
+  mutate(VAR2 = gsub("_|-", "", Genotype))
+
+#make reference
+var_ref<-var_ref[,c("FullSampleName", "Genotype")]
+
+#bind names to phenotypic data
+Pheno_FHB<-right_join(var_ref, Pheno_FHB, by="Genotype")
+
+#remove
+remove(genotype, Mt, snp_info)
+```
+
+### Perform hierarchial clustering model to Select Like Environments
+
+Here I run a FA using the repeated checks from each year to define which environments cluster. I will use this info to delineate which environments to use in the calculation of multi-environmental BLUPs.
+
+```{r, eval=FALSE}
+#pull out relevant data
+HC_dat<-Pheno_FHB %>%
+  select(Genotype, Env, SEV, FDK, DON)
+
+#find repeated checks
+n_geno<-length(unique(HC_dat$Env))
+check<-HC_dat %>% 
+  group_by(Genotype) %>%
+  count() %>%
+  filter(n>=n_geno)
+
+#select only those lines in those environments
+HC_dat<-HC_dat %>%
+  filter(Genotype %in% check$Genotype)
+
+#remove
+remove(n_geno, check)
+
+#create dataframes for HC
+HC_dat_SEV<-data.frame(Genotype=unique(HC_dat$Genotype))
+HC_dat_FDK<-data.frame(Genotype=unique(HC_dat$Genotype))
+HC_dat_DON<-data.frame(Genotype=unique(HC_dat$Genotype))
+
+for(i in unique(HC_dat$Env)){
+  #pull out environment
+  a<-HC_dat %>%
+    filter(Env==all_of(i)) %>%
+    distinct(Genotype, .keep_all = T)
+  
+  #pull out SEV observations and bind into lined up dataframe
+  b<-a %>%
+    select(Genotype, SEV)
+  colnames(b)[2]<-i
+  HC_dat_SEV<-left_join(HC_dat_SEV, b, by="Genotype")
+  
+  c<-a %>%
+    select(Genotype, FDK)
+  colnames(c)[2]<-i
+  HC_dat_FDK<-left_join(HC_dat_FDK, c, by="Genotype")
+  
+  d<-a %>%
+    select(Genotype, DON)
+  colnames(d)[2]<-i
+  HC_dat_DON<-left_join(HC_dat_DON, d, by="Genotype")
+  
+  remove(a,b,c,d)
+}
+
+#create list object for dataframes
+HC_dat<-list(SEV=HC_dat_SEV,
+              FDK=HC_dat_FDK,
+              DON=HC_dat_DON)
+
+#library
+library(factoextra)
+
+M_Env<-list()
+
+for (i in names(HC_dat)){
+  
+  #dataset
+  a<-HC_dat[[i]]
+  
+  #get rid of environments with missing data
+  a<-a[,colSums(is.na(a)) < nrow(a)]
+  
+  #only use complete datasets
+  a<-a[,colSums(!is.na(a))==nrow(a)]
+  
+  #calculate distance matrix
+  b<-dist(t(a[,-1]))
+
+  #hclust
+  b<-hclust(b, method = "ward.D")
+  
+  #elbow
+  a<-fviz_nbclust(t(a[,-1]), FUN=hcut, method="silhouette")
+  print(plot(a))
+
+  #select n-clusters
+  a<-as.numeric(a$data[a$data$y==max(a$data$y),]$clusters)
+  
+  #cut tree
+  c<-cutree(b,k=a)
+  
+  #plot cut tree
+  print(plot(b, main=paste("Clustering for", i)))
+  rect.hclust(b,k=a, border = 1:a)
+  
+  #put in list
+  M_Env[[i]]<-c
+}
+```
+
+### Pull Environments With High Heritability
+
+Here I run though environments and pull out only high heritability environments. This makes a lot of output, so I will hold the results until the bottom. 
+
+```{r, eval=FALSE}
+#library
+library(asreml)
+library(rrBLUP)
+
+#set up list of trait names
+traits<-c("SEV", "FDK", "DON")
+
+#pull out lines in USN
+g<-geno[,colnames(geno) %in% Pheno_FHB$FullSampleName]
+
+#calculate GRM
+GRM <- A.mat(t(g[,4:ncol(g)]))
+
+#make an empty object
+hs<-c()
+
+for (i in traits){
+  for(j in unique(Pheno_FHB$Env)){
+   
+    a<-Pheno_FHB[Pheno_FHB$Env==j,]
+    a<-a %>%
+      select(FullSampleName, Env, all_of(i)) %>%
+      drop_na(all_of(i))
+    if(nrow(a)==0){
+      print(paste("No data for", i, "in", j))
+      remove(a)
+    }else{
+      g<-GRM[rownames(GRM) %in% a[,1],
+             colnames(GRM) %in% a[,1]]
+      a<-a %>%
+        filter(FullSampleName %in% colnames(g)) %>%
+        filter(FullSampleName %in% rownames(g))
+      a[,1:2]<-lapply(a[,1:2], as.factor)
+      fit<-asreml(fixed=a[,i]~1,
+                  random = ~vm(FullSampleName,g),
+                  residual = ~idv(units),
+                  data = a,
+                  maxit=100)
+      h<-vpredict(fit,h~V1/(V1+V2))
+      h<-c(Trait=i, Env=j, h=h[1,1], SE=h[1,2])
+      hs<-rbind(hs,h)
+      
+      remove(a,g,fit,h)
+      
+    }
+  }
+}
+
+#heritability data frame
+hs<-as.data.frame(hs)
+```
+
+### Run Mixed Linear Models by Mega Environment to Get BLUEs for GWAS
+
+Here I run a loop to loop through all traits and derive BLUEs for the fixed genotype effect over all locations. 
+
+```{r, eval=FALSE}
+#library
+library(psych)
+
+#set up list of trait names
+traits<-c("SEV", "FDK", "DON")
+
+#check data
+pairs.panels(Pheno_FHB[,traits],
+             stars = T,
+             smooth = F)
+
+#set up object to bind results
+BLUEs<-data.frame(Genotype=unique(Pheno_FHB$Genotype))
+
+for (i in traits){
+  
+  #announce
+  print(paste("Running multi-environmental model for", i))
+  
+  #pull out mega environmental data
+  b<-M_Env[[i]]
+  
+  for(j in 1:max(b)){
+    
+    #pull out data
+    a<-Pheno_FHB %>%
+      select(Genotype, Env, all_of(i)) %>%
+      drop_na(all_of(i))
+    a[,1:2]<-lapply(a[,1:2], as.factor) 
+    
+        #Pull environments in the mega-environment
+    c<-b[b==j]
+    a<-a[a$Env %in% names(c),]
+    
+    #announce
+    print(paste("Number of environmets prior to filtration for mega-environment",j,"=", as.numeric(length(unique(a$Env)))))
+
+    #remove low heritability, high standard error environments
+    removeme<-hs[hs$Trait==i,]
+    removeme<-hs[hs$h<=0.25,]
+    removeme<-removeme$Env
+    a<-a[!a$Env %in% removeme,]
+  
+    #announce
+    print(paste("Number of environmets after filtration for mega-environment",j,":", as.numeric(length(unique(a$Env)))))
+    
+    #run asreml
+    fit<-asreml(fixed = a[,i]~Genotype,
+                random = ~idv(Env),
+                residual = ~idv(units),
+                data = a)
+    
+    #check significance
+    print(wald(fit))
+    
+    #run predictions
+    pred<-predict(fit, classify = "Genotype")$pvals[,1:2]
+    colnames(pred)[2]<-paste("ME_",j,"_",i,sep = "")
+    
+    #join dataframe
+    BLUEs<-left_join(BLUEs, pred, by="Genotype")
+    
+    #remove
+    remove(a,c,fit,pred,removeme)
+  }
+  #remove
+  remove(b)
+}
+
+#pairs
+pairs.panels(BLUEs[,2:ncol(BLUEs)], stars = T)
+```
+
+### Select Only Observations That are Shared Between Geno and Pheno
+
+```{r, eval=FALSE}
+#merge BLUEs and reference
+BLUEs<-right_join(var_ref,BLUEs, by="Genotype")
+
+#drop observations that don't have a fullsamplename
+BLUEs<-BLUEs %>%
+  drop_na(FullSampleName) %>%
+  select(-Genotype)
+```
+
+
+## Run GWAS in rrBLUP
+
+Here, I take the data previously read in and manipulated data to perform GWAS for the FHB trait BLUEs with the GBS data available. Looking for significance on either 1A, 1B, 3B, or 4A
+
+```{r, fig.width=16, fig.height=8, eval=FALSE}
+#library
+library(rrBLUP)
+library(ggplot2)
+library(CMplot)
+
+#create object for results
+GWAS_results <- data.frame(geno[,1:3])
+
+for(i in colnames(BLUEs)[2:ncol(BLUEs)]){
+  
+  #announce
+  print(paste("Preparing data for", i))
+  
+  #select dataframe
+  y <- BLUEs %>% 
+    select(FullSampleName, all_of(i)) %>%
+    drop_na(all_of(i))#drop the missing data
+  
+  #add the GWAS functions to make the SNP lists
+  g <- geno[ ,colnames(geno) %in% y$FullSampleName]
+  g <- colnames(g)
+  g <- geno %>% 
+    select(c("marker", "chr", "pos", all_of(g)))
+  
+  #select individuals in GRM
+  a<-A.mat(t(g[,4:ncol(g)]))
+    
+  #pull only individuals that show up in both GRM, g and y
+  y <- y[y$FullSampleName %in% rownames(GRM),]
+  
+  #announce
+  print(paste("Using n=",nrow(y), " observations for ", i, sep=""))
+  
+  #calculate the relationship matrix
+  lambda <- eigen(GRM)$values #check for population structure with PC analysis
+  plot(lambda/sum(lambda), ylab = "Fraction Explained")
+  
+  #calculate how many PCs to use
+  PCtoUse <- if (lambda[[1]]/sum(lambda) < 0.05) {
+              0
+              } else if (lambda[[1]]/sum(lambda) > 0.05 & lambda[[2]]/sum(lambda) < 0.05) {
+              1
+              } else if (lambda[[2]]/sum(lambda) > 0.05 & lambda[[3]]/sum(lambda) < 0.05) {
+              2
+              } else {
+              0
+              }
+  
+  #run GWAS
+  gwas <- GWAS(pheno = y, 
+               geno = g, 
+               K = a,
+               n.core = 1, 
+               n.PC = PCtoUse, 
+               min.MAF = 0.05,
+               plot=F,
+               P3D=T)
+  
+  #calculate bonferroni
+  bft=-log10(0.05/nrow(geno))
+  
+  #pretty plot
+  CMplot(gwas, 
+        plot.type="m",
+        col=c("grey30","grey60"),
+        LOG10=FALSE, 
+        ylim=NULL, 
+        threshold=c(4,bft), 
+        threshold.lty=c(2,1),
+        threshold.lwd=c(1,1), 
+        threshold.col=c( "darkred","darkgreen"), 
+        signal.col=c("darkgreen", "darkred"),
+        signal.cex=c(1.5,1.5),
+        signal.pch=c(19,19),
+        file.output=FALSE,
+        verbose=FALSE, 
+        width=14,
+        height=6,
+        main = paste("GWAS for", i))
+   
+  #bind GWAS
+  GWAS_results <- left_join(GWAS_results, gwas)
+  
+  #remove junk
+  remove(y,g,a,lambda,gwas)
+}
+
+#save the GWAS data
+write.csv(GWAS_results, file = "GWAS_FHB_2021_SNP_results_two_step.csv")
+```
+
+# QTL Imputation in 2019
+
+Here,I run machine learning models to analyze the 2019 data and predict scab QTL.
+
+## Read in the Data
+
+Here, I read in all the necessary data. 
+
+### Read in 2019 GBS Data
+
+```{r}
+#library
+library(tidyverse)
+
+#read in marker data - this is the 2019-2020 SNP file from February 2020
+#to read this file; this is the genotype data coded as 0, 1, 2
+Markers_2019 <- read.csv(file = "SG_Feb20_filtered_5493taxa_19442snp_012coding_021920.csv", 
+                    header = T, 
+                    row.names = 1, 
+                    check.names = F) 
+
+#header = T assigns column names, and row.names = 1 uses the first col in the data to assign row names
+#SNPs are down the side
+Markers_2019[1:5,1:5]
+
+#adjust the formatting on the FullSampleNames - there are a couple of odd underscores in here
+#change all underscores to dash
+colnames(Markers_2019) <- gsub("_", "-", colnames(Markers_2019)) 
+
+#change all to uppercase
+colnames(Markers_2019) <- toupper(colnames(Markers_2019)) 
+
+#shows 21234 SNPs and 6392 lines for SG
+dim(Markers_2019) 
+
+#transpose
+Markers_2019 <- as.data.frame(t(Markers_2019)) 
+
+#I need to parse these names for matching with the marker report
+Markers_2019 <- Markers_2019 %>% 
+  rownames_to_column(., var = "FullSampleName") %>% 
+  mutate(VarCode = FullSampleName) %>% 
+  separate(., VarCode, into = c("Nursery_Code", "LibPrepID", "Name"), sep = ":", extra = "merge")
+Markers_2019 <- separate(Markers_2019, Name, into = c("GSID", "Genotype"), sep = ":", extra = "drop", fill = "left")
+
+#remove all dashes, underscores, etc from the names in order to control for variation in the formatting
+Markers_2019 <- Markers_2019 %>% 
+  mutate(VAR2 = gsub("_|-", "", Genotype))
+
+#display matrix subset
+Markers_2019[1:5,1:5]
+
+#remove the junk left behind from formatting
+Markers_2019<-Markers_2019 %>%
+  select(-Nursery_Code, -LibPrepID, -GSID, -VAR2)
+
+#move genotype to front
+Markers_2019<-Markers_2019 %>%
+  select(FullSampleName, Genotype, everything())
+
+#make sure markers are numeric
+Markers_2019[,3:ncol(Markers_2019)]<-lapply(Markers_2019[,3:ncol(Markers_2019)], as.numeric)
+
+#list of genotypes and fullsamplenames
+var_list_2019 <- Markers_2019[,c("Genotype", "FullSampleName")]
+
+write.csv(var_list_2019,"SG20 Var List.csv", row.names = F)
+```
+
+### Reading in KASP Data
+
+Here, we read in the marker reports from GBG's lab to use as our training population and to validate the model in our test population. 
+
+```{r}
+#library
+library(readxl)
+
+#read in KASP report
+comb_report<-as.data.frame(read_excel("2019 SunGrains_FHBreport_04092020.xlsx"))
+
+#changing the OriginalSampleName to Genotype
+colnames(comb_report)[which(colnames(comb_report)=="Sample_Name")] <- "Genotype"
+
+#filter out duplicated genotypes
+comb_report <- comb_report %>% 
+  filter(!duplicated(Genotype))
+names(comb_report)
+
+#library
+library(knitr)
+
+#this combined report has data from Fhb1, 1A Neuse, 4A Neuse, and 1B Jamestown
+#here are tables reporting the frequencies of calls
+kable(table(comb_report$Fhb1), caption = "Calls for FHB1")
+kable(table(comb_report$Fhb_1B_Jamestown), caption = "Calls for 1B Jamestown")
+kable(table(comb_report$Fhb_1A_Neuse), caption = "Calls for 1A Neuse")
+kable(table(comb_report$Fhb_4A_Neuse), caption = "Calls for 4A Neuse")
+```
+
+## Data manipulation
+
+This section covers the manipulation of the data to fit R formats.
+
+### Transmute marker calls of reports
+
+Adjust some variables to make clear categories. We need to get rid of the different notations for ND, no call, NO CALL, etc. Also, go ahead and call the "?" ones as something. We can adjust this later if needed (maybe the "?" ones need to be NA?).   
+
+```{r}
+#Transmute FHB1
+comb_report <- comb_report %>% mutate(Fhb1 = ifelse(Fhb1 == "Fhb1?", "Fhb1",
+                                                        ifelse(Fhb1 == "Fhb1_het?", "Fhb1_het",
+                                                               ifelse(Fhb1 == "Fhb1_or_Fhb1_het", NA,
+                                                                      ifelse(Fhb1 == "ND", NA,
+                                                                        ifelse(Fhb1 == "NO CALL", NA, 
+                                                                               ifelse(Fhb1=="no?", "no", Fhb1))))))) %>%
+  mutate(Fhb1=ifelse(Fhb1=="Fhb1_het", NA, Fhb1))
+
+#Transmute 1B Jamestown
+comb_report <- comb_report %>% mutate(Fhb_1B_Jamestown = ifelse(Fhb_1B_Jamestown == "Fhb_1B_Jamestown_het?", "Fhb_1B_Jamestown_het",
+                                                        ifelse(Fhb_1B_Jamestown == "Fhb_1B_Jamestown_or_Fhb_1B_Jamestown_het", NA,
+                                                               ifelse(Fhb_1B_Jamestown == "Fhb_1B_Jamestown?", "Fhb_1B_Jamestown",
+                                                                    ifelse(Fhb_1B_Jamestown == "ND", NA,
+                                                                        ifelse(Fhb_1B_Jamestown == "", NA,   
+                                                                                ifelse(Fhb_1B_Jamestown == "NO CALL", NA, 
+                                                                                       ifelse(Fhb_1B_Jamestown == "Fhb_1B_Jamestown?", "Fhb_1B_Jamestown", Fhb_1B_Jamestown)))))))) %>%
+  mutate(Fhb_1B_Jamestown=ifelse(Fhb_1B_Jamestown=="Fhb_1B_Jamestown_het", NA, Fhb_1B_Jamestown))
+
+#Transmute 1A Neuse
+comb_report <- comb_report %>% mutate(Fhb_1A_Neuse = ifelse(Fhb_1A_Neuse == "Fhb_1A_Neuse?", "Fhb_1A_Neuse",
+                                                        ifelse(Fhb_1A_Neuse == "Fhb1_1A_Neuse?", "Fhb_1A_Neuse",
+                                                           ifelse(Fhb_1A_Neuse == "Fhb_1A_Neuse_het?", "Fhb_1A_Neuse_het",
+                                                              ifelse(Fhb_1A_Neuse == "NO CALL", NA,
+                                                                    ifelse(Fhb_1A_Neuse == "no_call", NA, 
+                                                                         ifelse(Fhb_1A_Neuse == "", NA,
+                                                                           ifelse(Fhb_1A_Neuse == "ND", NA, Fhb_1A_Neuse)))))))) %>%
+  mutate(Fhb_1A_Neuse=ifelse(Fhb_1A_Neuse=="Fhb_1A_Neuse_het", NA, Fhb_1A_Neuse))
+
+#Transmute 4A Neuse
+comb_report <- comb_report %>% mutate(Fhb_4A_Neuse = ifelse(Fhb_4A_Neuse == "Fhb_4A_Neuse?", "Fhb_4A_Neuse",
+                                                        ifelse(Fhb_4A_Neuse == "Fhb_4A_Neuse_het?", "Fhb_4A_Neuse_het",
+                                                           ifelse(Fhb_4A_Neuse == "Fhb_4A_Neuse_or_Fhb_4A_Neuse_het", NA,
+                                                              ifelse(Fhb_4A_Neuse == "no call", NA,
+                                                                    ifelse(Fhb_4A_Neuse == "no_call", NA, 
+                                                                         ifelse(Fhb_4A_Neuse == "", NA,
+                                                                           ifelse(Fhb_4A_Neuse == "ND", NA, 
+                                                                                  ifelse(Fhb_4A_Neuse == "NO CALL", NA, Fhb_4A_Neuse))))))))) %>%
+  mutate(Fhb_4A_Neuse=ifelse(Fhb_4A_Neuse=="Fhb_4A_Neuse_het", NA, Fhb_4A_Neuse))
+
+
+#this combined report has data from Fhb1, 1A Neuse, 4A Neuse, and 1B Jamestown
+#here are tables reporting the frequencies of calls
+kable(table(comb_report$Fhb1), caption = "Calls for FHB1")
+kable(table(comb_report$Fhb_1B_Jamestown), caption = "Calls for 1B Jamestown")
+kable(table(comb_report$Fhb_1A_Neuse), caption = "Calls for 1A Neuse")
+kable(table(comb_report$Fhb_4A_Neuse), caption = "Calls for 4A Neuse")
+
+### Made all ambiguous calls into NAs and all missing data or questions NAs###
+
+#I need to format the genotype names in the combined report
+#and make a list to match the report to the pheotypic/genotypic data
+comb_report$Genotype <- gsub("_", "-", comb_report$Genotype) 
+comb_report$Genotype <- toupper(comb_report$Genotype) 
+comb_report <- left_join(comb_report, var_list_2019, by = "Genotype")
+ 
+#select the data for the QTL we want
+comb_report <- comb_report %>% 
+  filter(FullSampleName %in% Markers_2019$FullSampleName) %>% 
+  filter(!duplicated(FullSampleName)) %>% 
+  select(FullSampleName, 
+         Genotype, 
+         Fhb1, 
+         Fhb_1B_Jamestown, 
+         Fhb_1A_Neuse,
+         Fhb_4A_Neuse)
+
+#this combined report has data from Fhb1, 1A Neuse, 4A Neuse, and 1B Jamestown
+#here are tables reporting the frequencies of calls
+kable(table(comb_report$Fhb1), caption = "Calls for FHB1")
+kable(table(comb_report$Fhb_1B_Jamestown), caption = "Calls for 1B Jamestown")
+kable(table(comb_report$Fhb_1A_Neuse), caption = "Calls for 1A Neuse")
+kable(table(comb_report$Fhb_4A_Neuse), caption = "Calls for 4A Neuse")
+
+sg20_freq=data.frame(Population="sg20",
+                     Fhb1=table(comb_report$Fhb1)[1]/sum(table(comb_report$Fhb1)),
+                     "Qfhb.vt-1B"=table(comb_report$Fhb_1B_Jamestown)[1]/sum(table(comb_report$Fhb_1B_Jamestown)),
+                     "Qfhb.nc-1A"=table(comb_report$Fhb_1A_Neuse)[1]/sum(table(comb_report$Fhb_1A_Neuse)),
+                     "Qfhb.nc-4A"=table(comb_report$Fhb_4A_Neuse)[1]/sum(table(comb_report$Fhb_4A_Neuse)),
+                     check.names = F)
+
+#Now we remove any genotypes in the combined report 
+#that appear in the UFHBN to avoid insider trading
+comb_report<-comb_report %>%
+  filter(!Genotype %in% Pheno_FHB$Genotype)
+```
+
+### Creating the data set(s)
+
+In the example I looked at, the data is phenotype then marker in the same data frame. I'm not able to pass in the entire set of SNPs (error in the run) so I am going to subset by chromosome here and then merge with phenotype data. **The phenotype data here is the KASP call data.**
+
+```{r}
+#get the genotype data for the chromosome of interest for FHB1
+genotype_3B <- select(Markers_2019, c(FullSampleName, contains("S3B"))) 
+genotype_3B[1:5, 1:5]
+
+#append phenotypic data (KASP calls) to genotypic data
+Fhb1_dat <- merge((comb_report %>% select(FullSampleName, Fhb1)), 
+                  genotype_3B, 
+                  by = "FullSampleName", 
+                  all.x = TRUE)
+
+#get rid of NAs and format factor
+Fhb1_dat <- Fhb1_dat[complete.cases(Fhb1_dat),] 
+Fhb1_dat$Fhb1 <- as.factor(Fhb1_dat$Fhb1)
+
+### Repeat this process for the other QTL ###
+
+#Jamestown 1B
+genotype_1B <- select(Markers_2019, c(FullSampleName, contains("S1B"))) #get the genotype data for the chromosome of interest
+genotype_1B[1:5, 1:5]
+
+JT1B_dat <- merge((comb_report %>% select(FullSampleName, Fhb_1B_Jamestown)), 
+                  genotype_1B, 
+                  by = "FullSampleName", 
+                  all.x = TRUE)
+
+JT1B_dat <- JT1B_dat[complete.cases(JT1B_dat),] #get rid of any missing data from this merge
+JT1B_dat$Fhb_1B_Jamestown <- as.factor(JT1B_dat$Fhb_1B_Jamestown) #needs to be a factor
+
+#Neuse 1A
+genotype_1A <- select(Markers_2019, c(FullSampleName, contains("S1A"))) #get the genotype data for the chromosome of interest
+genotype_1A[1:5, 1:5]
+
+N1A_dat <- merge((comb_report %>% select(FullSampleName, Fhb_1A_Neuse)), 
+                 genotype_1A, 
+                 by = "FullSampleName", 
+                 all.x = TRUE)
+
+N1A_dat <- N1A_dat[complete.cases(N1A_dat),] #get rid of any missing data from this merge
+N1A_dat$Fhb_1A_Neuse <- as.factor(N1A_dat$Fhb_1A_Neuse) #needs to be a factor
+
+#Neuse 4A
+genotype_4A <- select(Markers_2019, c(FullSampleName, contains("S4A"))) #get the genotype data for the chromosome of interest
+genotype_4A[1:5, 1:5]
+
+N4A_dat <- merge((comb_report %>% select(FullSampleName, Fhb_4A_Neuse)), 
+                 genotype_4A, 
+                 by = "FullSampleName", 
+                 all.x = TRUE)
+
+N4A_dat <- N4A_dat[complete.cases(N4A_dat),] #get rid of any missing data from this merge
+N4A_dat$Fhb_4A_Neuse <- as.factor(N4A_dat$Fhb_4A_Neuse) #needs to be a factor
+```
+
+### Calculate BLUEs for Scab Nursery and Merge KASP calls to data
+
+Here I take the USN data, use all sight-years data of lines that have complete calls for 1A, 1B, 3B, and 4A to calculate BLUEs, and bind together the lines that have GBS data, KASP data, and phenotypic data to use in single marker regression. 
+
+```{r}
+#library
+library(asreml)
+library(rrBLUP)
+library(tidyverse)
+
+dat<-Pheno_FHB %>%
+  filter(!Year=="2020") %>%
+  select(1,2,4,SEV,FDK,DON,HeadDate,PlantHt,QTL_1A,JT_1B,QTL_4A,Fhb1) %>%
+  rename(N1A=QTL_1A) %>%
+  rename(N4A=QTL_4A) %>%
+  rename(JT1B=JT_1B) %>%
+  mutate(Fhb1=ifelse(Fhb1==1,"Fhb1",
+                     ifelse(Fhb1==0, "no", NA))) %>%
+  mutate(N1A=ifelse(N1A==1,"Fhb_1A_Neuse",
+                     ifelse(N1A==0, "no", NA))) %>%
+  mutate(N4A=ifelse(N4A==1,"Fhb_4A_Neuse",
+                     ifelse(N4A==0, "no", NA))) %>%
+  mutate(JT1B=ifelse(JT1B==1,"Fhb_1B_Jamestown",
+                     ifelse(JT1B==0, "no", NA))) 
+
+UFHB_freq=data.frame(Population="SUWWSN",
+                     Fhb1=table(dat$Fhb1)[1]/sum(table(dat$Fhb1)),
+                     "Qfhb.vt-1B"=table(dat$JT1B)[1]/sum(table(dat$JT1B)),
+                     "Qfhb.nc-1A"=table(dat$N1A)[1]/sum(table(dat$N1A)),
+                     "Qfhb.nc-4A"=table(dat$N4A)[1]/sum(table(dat$N4A)),
+                     check.names = F)
+
+UFHBN_var_list<-dat %>% select(Genotype, FullSampleName) %>% distinct()
+write.csv(UFHBN_var_list, "SUWWSN Var List.csv", row.names = F)
+
+#create GRM
+g<-as.data.frame(Markers_2019[Markers_2019$FullSampleName %in% dat$FullSampleName,])
+rownames(g)=NULL
+g<-column_to_rownames(g,var = "FullSampleName")
+g<-g[,-1]
+g<-as.matrix(g)
+pca<-prcomp(g)
+sum_pca<-summary(pca)
+sum_pca$importance[,1:4]
+pca<-as.data.frame(pca$x)[,1:3]
+pca<-rownames_to_column(pca, var="FullSampleName")
+
+#bind in PCA to phenotypic data of UFHBN
+dat<-left_join(dat, pca, by="FullSampleName")
+
+#only select data that has the PCs
+dat<-dat[dat$FullSampleName %in% rownames(g),]
+
+#results object
+results<-c()
+
+#Run Models
+for(i in c("SEV","FDK","DON","HeadDate","PlantHt")){
+  for(j in c("Fhb1", "N1A", "N4A", "JT1B")){
+    
+    print(paste("Analyzing", j, "for", i))
+    
+    a<-dat %>%
+      drop_na(all_of(j)) %>%
+      drop_na(all_of(i)) %>%
+      select(Genotype, FullSampleName, Env, PC1, PC2, PC3, all_of(j), all_of(i)) %>%
+      drop_na()
+    
+    a<-a %>%
+      filter(FullSampleName %in% rownames(g))
+    
+    colnames(a)[ncol(a)-1]<-"QTL"
+    colnames(a)[ncol(a)]<-"Y"
+    a[,"QTL"]<-ifelse(a[,"QTL"]=="no",0, 1)
+    a[,1:3]<-lapply(a[,1:3], as.factor)
+    a[,"QTL"]<-as.factor(a[,"QTL"])
+
+    fit<-asreml(fixed = Y~QTL+PC1+PC2+PC3,
+                random = ~idv(FullSampleName)+idv(Env),
+                residual = ~idv(units),
+                data = a)
+    
+    n=as.numeric(nrow(filter(a, QTL==1)))
+
+    q<-wald(fit)
+    p<-predict(fit, classify = "QTL")
+    d<-c(`Trait`=i,
+         `QTL`=j,
+         `Resistance Allele Effect`=fit$coefficients$fixed["QTL_1",],
+         `QTL SE`=(sqrt(fit$vcoeff$fixed[5])/sqrt(n)),
+         `QTL Present Estimated Mean`=p$pvals[p$pvals$QTL==1,"predicted.value"],
+         `QTL Present Estimated SE`=p$pvals[p$pvals$QTL==1,"std.error"],
+         `QTL Absent Estimated Mean`=p$pvals[p$pvals$QTL==0,"predicted.value"],
+         `QTL Absent Estimated SE`=p$pvals[p$pvals$QTL==0,"std.error"],
+         `Wald Statistic`=q[rownames(q)=="QTL","Wald statistic"],
+         `Sum of Sq`=q[rownames(q)=="QTL","Sum of Sq"],
+         `Degrees of Freedom`=q[rownames(q)=="QTL","Df"],
+         `P Value (Chisq)`=q[rownames(q)=="QTL","Pr(Chisq)"])
+    d<-as.data.frame(t(d))
+    results<-rbind(results,d)
+    remove(q,p,a,d)
+    }
+}
+
+#make object
+results<-as.data.frame(results)
+results<-results[order(results$QTL, results$Trait), ]
+
+#write out raw results
+write.csv(results,"Single_Marker_Analysis_for_UFHBN_Observed_2020.csv", row.names = F)
+
+#make a pretty table
+library(formattable)
+for (i in colnames(results)[c(3:(ncol(results)-1))]){
+  results[,i]<-as.numeric(results[,i])
+  results[,i]<-round(results[,i],3)
+}
+
+rownames(results)<-seq(1,nrow(results))
+formattable(results,
+            align="c")
+
+#make list to pull names of eligible lines for forward validation
+UFHBN_fwd_valid<-list()
+
+#single marker regression and preparing for forward validation
+for(i in c("N1A","JT1B", "N4A", "Fhb1")){
+  if(i=="N1A"){
+    a<-dat %>%
+      select(FullSampleName, Genotype, Env ,all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+      drop_na(all_of(i))
+    b<-Markers_2019[,c("FullSampleName",colnames(Markers_2019)[grep("1A",colnames(Markers_2019))])]
+    a<-left_join(a,b, by="FullSampleName")
+    z=paste(i,"_dat",sep="")
+    UFHBN_fwd_valid[[z]]<-a
+    remove(a,b,z)
+  }else
+    if(i=="JT1B"){
+      a<-dat %>%
+        select(FullSampleName, Genotype, Env, all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+        drop_na(all_of(i))
+      b<-Markers_2019[,c("FullSampleName",colnames(Markers_2019)[grep("1B",colnames(Markers_2019))])]
+      a<-left_join(a,b, by="FullSampleName")
+      z=paste(i,"_dat",sep="")
+      UFHBN_fwd_valid[[z]]<-a
+      remove(a,b,z)
+    }else
+      if(i=="N4A"){
+        a<-dat %>%
+          select(FullSampleName, Genotype, Env, all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+          drop_na(all_of(i))
+        b<-Markers_2019[,c("FullSampleName",colnames(Markers_2019)[grep("4A",colnames(Markers_2019))])]
+        a<-left_join(a,b, by="FullSampleName")
+        z=paste(i,"_dat",sep="")
+        UFHBN_fwd_valid[[z]]<-a
+        remove(a,b,z)
+      }else
+        if(i=="Fhb1"){
+          a<-dat %>%
+            select(FullSampleName, Genotype, Env, all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+            drop_na(all_of(i))
+          b<-Markers_2019[,c("FullSampleName",colnames(Markers_2019)[grep("3B",colnames(Markers_2019))])]
+          a<-left_join(a,b, by="FullSampleName")
+          z=paste(i,"_dat",sep="")
+          UFHBN_fwd_valid[[z]]<-a
+          remove(a,b,z) 
+        }else{
+          print(paste("Something is wrong with", i, "check loop."))
+        }
+}
+```
+
+## Writing a function To Analyze QTL
+
+The process above has a couple key steps: 
+
+1. Run correlation study to select correlated SNPs with the marker call.  
+2. Threshold markers based on correlation (top 50 most correlated markers).  
+3. Run ML models to predict QTL presence.  
+4. Forward predict the partitioned testing set of Sunwheat
+5. Forward predict the UFHBN
+6. Run MLMs for UFHBN predictive calls.
+
+Now that we have covered that, I will write a massive nasty for-loop to cover those steps, and produce results for each QTL. 
+
+```{r}
+#load dependencies
+library(caret)
+library(gbm)
+library(tidyverse)
+library(asreml)
+
+
+#write as a function 
+machine_models<-function(QTL_obj, UFHBN_obj, threshold){
+
+  #create empty list and objects for forward validation within training pop
+  results_by_QTL<-list()
+  table_by_QTL<-list()
+  
+  #create empty list for importance
+  importance_by_QTL<-list()
+  
+  #create empty list and objects for forward validation with the UFHBN
+  results_by_QTL_UFHBN<-list()
+  table_by_QTL_UFHBN<-list()
+  
+  for (i in names(QTL_obj)){
+  
+    #announce
+    print(paste("Running predictions for", i))
+    
+    #pull dataframe
+    sungrains_full<-QTL_obj[[i]]
+    
+    #fix dataframe if needed
+    if(is.null(sungrains_full$FullSampleName)){
+      sungrains_full<-sungrains_full
+    }else{
+    rownames(sungrains_full)<-sungrains_full$FullSampleName
+    sungrains_full<-sungrains_full[,-1]
+    }
+    
+    #pull in UFHBN data for forward validation
+    UFHBN_full<-UFHBN_obj[[i]]
+    
+    #announce
+    print("Moving onto models...")
+    
+    #make empty list and object for loop
+    results<-list()
+    table<-c()
+    importance<-data.frame(Markers=colnames(sungrains_full)[2:ncol(sungrains_full)])
+    
+    #make empty list and object for loop for UFHBN
+    results_UFHBN<-list()
+    table_UFHBN<-c()
+    
+    #another nasty loop
+    for (j in c(0.9,0.75,0.5,0.25,0.1)){
+      
+      #announce
+      print(paste("Creating partition using ", round(j*100, 0), "% of available data for ", i ,"...", sep=""))
+      
+      #make partitions 
+      index <- sample(rownames(sungrains_full), size = round(nrow(sungrains_full)*j,0))
+      train <- sungrains_full[rownames(sungrains_full) %in% index,]
+      test <- sungrains_full[!(rownames(sungrains_full) %in% index),]
+      
+      #show frequencies
+      print(kable(round(table(train[,1])/nrow(train),3), caption = "Training Allele Frequencies"))
+      print(kable(round(table(test[,1])/nrow(test),3), caption = "Testing Allele Frequencies"))
+      
+      #announce
+      print("Checking marker correlation in the training population")
+      
+      #create empty object for corrs
+      corr<-c()
+      
+      #announce
+      print(paste(ncol(train)-1, "markers prior to filtering..."))
+      
+      #loop to calculate correlations
+      for (z in colnames(train)[2:ncol(train)]){
+        q<-colnames(train)[1]
+        b<-train %>% 
+          select(all_of(q), all_of(z)) %>% 
+          drop_na()
+        b[,1]<-ifelse(b[,1]=="no", 0, 1)
+        b<-cor(b)[1,2]
+        corr<-rbind(corr, data.frame(marker=z,corr=b))
+        }
+      
+      #modify to get position vs correlation
+      corr<-corr %>%
+        separate(marker, into=c("chromosome", "pos"), remove = F, sep="_")
+      
+      #plot results
+      plot(corr$pos, abs(corr$corr), 
+           main=paste("Correlation Study of", i, "for training size", j),
+           xlab="Base Pair Position",
+           ylab="|R|")
+      
+      #filter out correlated markers
+      corr<-corr[order(abs(corr$corr), decreasing = T),]
+      corr<-corr[1:threshold,]
+      abline(h=min(abs(corr$corr)), col="red", lty=2)
+      corrmark<-corr[1:5,]
+      corrmark$res<-ifelse(corrmark$corr>0,2,0)
+      
+      #filter training, test, and UFHBN to have the correct number of markers
+      train<-train %>%
+        select(1, unique(corr$marker))
+      test<-test %>%
+        select(1, unique(corr$marker))
+      
+      #announce
+      print(paste(ncol(train)-1, "markers after to filtering..."))
+      
+      #make folds
+      myFolds <- createFolds(train[,1], k = 5)
+      
+      #tune parameters
+      myControl <- trainControl(
+        classProb = TRUE,
+        verboseIter = FALSE,
+        savePredictions = TRUE,
+        index = myFolds,
+        number = 5,
+        repeats = 1000,
+        method = "repeatedcv")
+      
+      #announce
+      print("Done!")
+      
+      #announce
+      print("K nearest neighbors...")
+      
+      #create model statement
+      q<-paste(colnames(train)[1], " ~ .", sep = "")
+    
+      #create k
+      k<-c(seq(0, (ncol(train)-1), by = 5)[-1])
+      k<-k[k<=100]
+      if(length(k)<2){
+      k<-ncol(train)-1
+      k<-c(1,k)
+      }else{
+        k<-c(1,k)
+      }
+      
+      #limit k
+      k_knn<-k[k<=min(length(myFolds$Fold1), 
+                      length(myFolds$Fold2),
+                      length(myFolds$Fold3),
+                      length(myFolds$Fold4),
+                      length(myFolds$Fold5))]
+      #limit k to 25
+      k_knn=seq(from=1, to=25, by=2)
+      
+      #knn model
+      knn_model <- train(formula(q), 
+                         data = train,
+                         method = "knn",
+                         tuneGrid = expand.grid(
+                         k = k_knn),
+                         trControl = myControl)
+      
+      print(knn_model)
+      
+      knn_imp<-varImp(knn_model, scale = T)[["importance"]][1]
+      knn_imp<-rownames_to_column(knn_imp, var="Markers")
+      colnames(knn_imp)[2]<-paste(i,j,"knn",sep="_")
+      
+      #announce
+      print("Done!")
+      
+      #announce
+      print("Random forest...")
+      
+      #random forest
+      rf_model <- train(formula(q),
+                         train,
+                         method = "rf",
+                         tuneGrid = expand.grid(
+                            mtry = k),
+                         trControl = myControl)
+      print(rf_model)
+      
+      rf_imp<-varImp(rf_model,scale = T)[["importance"]][1]
+      rf_imp<-rownames_to_column(rf_imp, var="Markers")
+      colnames(rf_imp)[2]<-paste(i,j,"rf",sep="_")
+      
+      #announce
+      print("Done!")
+      
+      #announce
+      print("Gradient boosting machine...")
+      
+      #set leaf limit for GBM
+      leaf<-min(length(myFolds$Fold1), 
+                length(myFolds$Fold2),
+                length(myFolds$Fold3),
+                length(myFolds$Fold4),
+                length(myFolds$Fold5))
+      leaf<-as.numeric(leaf)
+      leaf<-c(round(leaf/10), round(leaf/20), round(leaf/30))
+      
+      
+      #gbm
+      gbm_model <- train(formula(q), 
+                         data = train,
+                         method = "gbm",
+                         tuneGrid = expand.grid(
+                           n.trees = seq(from = 0, to=1000, by=100)[-1], #number of trees
+                           interaction.depth = 1,
+                           shrinkage = c(0.001, 0.01, 0.1), #learning rate
+                           n.minobsinnode = leaf), #minimum observations in a node
+                         verbose = FALSE,
+                         trControl = myControl)
+      print(gbm_model)
+      
+      gbm_imp<-varImp(gbm_model, scale = T)[["importance"]][1]
+      gbm_imp<-rownames_to_column(gbm_imp, var="Markers")
+      colnames(gbm_imp)[2]<-paste(i,j,"gbm",sep="_")  
+      
+      #announce
+      print("Done!")
+      
+      #announce
+      print("Producing confusion matrix and prediction dataframe...")
+      
+      #announce
+      print("Predicting QTL call using top correlated SNP")
+      p_n <- test %>% 
+        select(1, all_of(corrmark$marker))
+      
+      for(z in colnames(p_n)[2:ncol(p_n)]){
+        p_n[,z]=ifelse(p_n[,z]==corrmark[corrmark$marker==z, "res"], 1, 0)
+      }
+      
+      p_n$sum <- p_n[,2] 
+      name <- as.character(unique(p_n[,1]))
+      name <- name[!name=="no"]
+      p_n$p_n <- ifelse(p_n$sum==1,name,"no")
+      p_n$p_n <- as.factor(p_n$p_n)
+      m_n <- confusionMatrix(p_n[,"p_n"], p_n[,1])
+      t_n <- data.frame(Model="Naive",
+                        QTL=colnames(sungrains_full)[1],
+                        Training_Size=j,
+                        Kappa=m_n$overall[2],
+                        Accuracy=m_n$overall[1],
+                        Lower_CI_Accuracy=m_n$overall[3],
+                        Upper_CI_Accuracy=m_n$overall[4],
+                        Sensitivity=m_n$byClass[1],
+                        Specificity=m_n$byClass[2],
+                        Precision=m_n$byClass[5])
+      p_n=p_n$p_n
+    
+      #announce
+      print("Predicting for KNN")
+      
+      p_knn <- predict(knn_model, test)
+      m_knn <- confusionMatrix(p_knn, test[,1])
+      t_knn <- data.frame(Model="KNN",
+                          QTL=colnames(sungrains_full)[1],
+                          Training_Size=j,
+                          Kappa=m_knn$overall[2],
+                          Accuracy=m_knn$overall[1],
+                          Lower_CI_Accuracy=m_knn$overall[3],
+                          Upper_CI_Accuracy=m_knn$overall[4],
+                          Sensitivity=m_knn$byClass[1],
+                          Specificity=m_knn$byClass[2],
+                          Precision=m_knn$byClass[5])
+        
+      #announce
+      print("Predicting for RF")    
+      
+      p_rf <- predict(rf_model, test)
+      m_rf <- confusionMatrix(p_rf, test[,1])
+      t_rf <- data.frame(Model="RF",
+                         QTL=colnames(sungrains_full)[1],
+                         Training_Size=j,
+                         Kappa=m_rf$overall[2],
+                         Accuracy=m_rf$overall[1],
+                         Lower_CI_Accuracy=m_rf$overall[3],
+                         Upper_CI_Accuracy=m_rf$overall[4],
+                         Sensitivity=m_rf$byClass[1],
+                         Specificity=m_rf$byClass[2],
+                         Precision=m_rf$byClass[5])
+      
+      #announce
+      print("Predicting for GBM")
+      
+      p_gbm <- predict(gbm_model, test)
+      m_gbm <- confusionMatrix(p_gbm, test[,1])
+      t_gbm <- data.frame(Model="GBM",
+                          QTL=colnames(sungrains_full)[1],
+                          Training_Size=j,
+                          Kappa=m_gbm$overall[2],
+                          Accuracy=m_gbm$overall[1],
+                          Lower_CI_Accuracy=m_gbm$overall[3],
+                          Upper_CI_Accuracy=m_gbm$overall[4],
+                          Sensitivity=m_gbm$byClass[1],
+                          Specificity=m_gbm$byClass[2],
+                          Precision=m_gbm$byClass[5])
+        
+      #bind together
+      test_out <- bind_cols(test, 
+                            as.data.frame(p_n),
+                            as.data.frame(p_knn), 
+                            as.data.frame(p_rf), 
+                            as.data.frame(p_gbm))
+      
+      #make a dataframe for list
+      test_out <- test_out %>% 
+        select(1, p_n, p_knn, p_rf, p_gbm) %>% 
+        rownames_to_column(., var = "FullSampleName")
+      
+      #rename for ease of finding 
+      q=paste("Training_", round(j*100, 0), "%", sep="" )
+      
+      results[[q]]<-test_out
+      table<-rbind(table, t_n, t_knn, t_rf, t_gbm)
+      temp<-left_join(knn_imp, rf_imp, by="Markers")
+      temp<-left_join(temp, gbm_imp, by="Markers")
+      importance<-left_join(importance,temp, by="Markers")
+      remove(q,temp)
+      
+      #announce 
+      print(paste("Forward prediction for UFHBN"))
+      
+      #split phenotype and genotype info
+      z=gsub("_dat","",i)
+      pheno<-UFHBN_full %>%
+        select(1:12)
+      pred<-UFHBN_full %>% 
+        select(FullSampleName, all_of(z), all_of(corr$marker)) %>%
+        distinct(FullSampleName, .keep_all = T) %>%
+        column_to_rownames(var="FullSampleName")
+      pred[,z]<-as.factor(pred[,z])
+      print(kable(round(table(pred[,1])/nrow(pred),3), caption = "UFHBN Allele Frequencies"))
+      remove(z)
+      
+      #announce
+      print("Predicting QTL call using top 5 correlated SNPs in UFHBN")
+      p_n <- pred %>% 
+        select(1, all_of(corrmark$marker))
+      
+      for(z in colnames(p_n)[2:ncol(p_n)]){
+        p_n[,z]=ifelse(p_n[,z]==corrmark[corrmark$marker==z, "res"], 1, 0)
+      }
+      
+      p_n$sum <- p_n[,2] 
+      name <- as.character(unique(p_n[,1]))
+      name <- name[!name=="no"]
+      p_n$p_n <- ifelse(p_n$sum==1,name,"no")
+      p_n$p_n <- as.factor(p_n$p_n)
+      m_n <- confusionMatrix(p_n[,"p_n"], p_n[,1])
+      t_n <- data.frame(Model="Naive",
+                        QTL=colnames(sungrains_full)[1],
+                        Training_Size=j,
+                        Kappa=m_n$overall[2],
+                        Accuracy=m_n$overall[1],
+                        Lower_CI_Accuracy=m_n$overall[3],
+                        Upper_CI_Accuracy=m_n$overall[4],
+                        Sensitivity=m_n$byClass[1],
+                        Specificity=m_n$byClass[2],
+                        Precision=m_n$byClass[5])
+      p_n=p_n$p_n
+    
+      
+      #announce
+      print("Predicting for KNN for UFHBN")
+          
+      p_knn <- predict(knn_model, pred)
+      m_knn <- confusionMatrix(p_knn, pred[,1])
+      t_knn<-data.frame(Model="KNN",
+                        QTL=colnames(sungrains_full)[1],
+                        Training_Size=j,
+                        Kappa=m_knn$overall[2],
+                        Accuracy=m_knn$overall[1],
+                        Lower_CI_Accuracy=m_knn$overall[3],
+                        Upper_CI_Accuracy=m_knn$overall[4],
+                        Sensitivity=m_knn$byClass[1],
+                        Specificity=m_knn$byClass[2],
+                        Precision=m_knn$byClass[5]) 
+      
+      #announce
+      print("Predicting for RF for UFHBN")    
+      
+      p_rf <- predict(rf_model, pred)
+      m_rf <- confusionMatrix(p_rf, pred[,1])
+      t_rf<-data.frame(Model="RF",
+                        QTL=colnames(sungrains_full)[1],
+                        Training_Size=j,
+                        Kappa=m_rf$overall[2],
+                        Accuracy=m_rf$overall[1],
+                        Lower_CI_Accuracy=m_rf$overall[3],
+                        Upper_CI_Accuracy=m_rf$overall[4],
+                        Sensitivity=m_rf$byClass[1],
+                        Specificity=m_rf$byClass[2],
+                        Precision=m_rf$byClass[5])
+      
+      #announce
+      print("Predicting for GBM for UFHBN")
+      
+      p_gbm <- predict(gbm_model, pred)
+      m_gbm <- confusionMatrix(p_gbm, pred[,1])
+      t_gbm<-data.frame(Model="GBM",
+                        QTL=colnames(sungrains_full)[1],
+                        Training_Size=j,
+                        Kappa=m_gbm$overall[2],
+                        Accuracy=m_gbm$overall[1],
+                        Lower_CI_Accuracy=m_gbm$overall[3],
+                        Upper_CI_Accuracy=m_gbm$overall[4],
+                        Sensitivity=m_gbm$byClass[1],
+                        Specificity=m_gbm$byClass[2],
+                        Precision=m_gbm$byClass[5])
+      
+      #place UFHBN predictions in their own files
+      #bind together
+      test_out <- bind_cols(pred, 
+                            as.data.frame(p_n),
+                            as.data.frame(p_knn), 
+                            as.data.frame(p_rf), 
+                            as.data.frame(p_gbm))
+      
+      #make a dataframe for list
+      test_out <- test_out %>% 
+        select(1, p_n, p_knn, p_rf, p_gbm) %>% 
+        rownames_to_column(., var = "FullSampleName")
+      
+      #bind phenotypic data back in
+      test_out<-left_join(pheno, test_out, by=c("FullSampleName", gsub("_dat","",i)))
+      
+      #rename for ease of finding 
+      q=paste("Training_", round(j*100, 0), "%", sep="" )
+      
+      results_UFHBN[[q]]<-test_out
+      table_UFHBN<-rbind(table_UFHBN, t_n, t_knn, t_rf, t_gbm)
+      remove(q)
+      
+      #announce
+      print("Done, moving to the next partition!")
+      print("###################################")
+      }
+   
+    #store results
+    results_by_QTL[[i]]<-results
+    table_by_QTL[[i]]<-table
+    importance_by_QTL[[i]]<-importance
+    
+    #store results for UFHBN
+    results_by_QTL_UFHBN[[i]]<-results_UFHBN
+    table_by_QTL_UFHBN[[i]]<-table_UFHBN
+    
+    #announce
+    print(paste("Done with ", i, ";", "moving onto next QTL!", sep = ""))
+    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+  }
+  
+  print("Finished with machine learning predictions, moving on to mixed linear models!")
+  
+  #results object
+  results<-list()
+  
+  #reference objects
+  w<-names(results_by_QTL_UFHBN)
+  x<-names(results_by_QTL_UFHBN[[1]])
+  y<-colnames((results_by_QTL_UFHBN)[[1]][[1]])[13:ncol((results_by_QTL_UFHBN)[[1]][[1]])]
+  z<-c("SEV","FDK","DON","HeadDate","PlantHt")
+  
+  #Run Models
+  for(i in w){
+    for(j in x){
+      for(k in y){
+        for(l in z){
+          
+          #announce
+          print("###################################")
+          print(paste("Analysis of", 
+                      i, 
+                      "for", 
+                      j, 
+                      "for model", 
+                      k, 
+                      "for trait",
+                      l))
+          
+          #data frame 
+          a<-results_by_QTL_UFHBN[[i]][[j]]
+          a<-a %>%
+            select(-all_of(gsub("_dat","",i)))
+          
+          #select relevant columns
+          a<-a %>%
+            select(FullSampleName, Env, PC1, PC2, PC3, all_of(k), all_of(l)) %>%
+            drop_na()
+          
+          #rename levels
+          a[,k]<-ifelse(a[,k]=="no",0,1)
+          a[,k]<-as.factor(a[,k])
+          print("Predicted QTL Observations")
+          print(table(a[,k]))
+          
+          #now make it a factor
+          a[,1:2]<-lapply(a[,1:2],as.factor)
+          
+          #rename k and l
+          colnames(a)[ncol(a)-1]<-"QTL_pred"
+          a$QTL_pred<-as.factor(a$QTL_pred)
+          colnames(a)[ncol(a)]<-"Y"
+          a$Y<-as.numeric(a$Y)
+           
+          #run model
+          fit<-asreml(fixed = Y~QTL_pred+PC1+PC2+PC3,
+                    random = ~ idv(FullSampleName)+idv(Env),
+                    residual = ~idv(units),
+                    data = a)
+          
+          beta<-fit$coefficients$fixed["QTL_pred_1"]
+          
+          n=as.numeric(nrow(filter(a, QTL_pred==1)))
+          
+          q<-wald(fit)
+    
+          p<-predict(fit, classify = "QTL_pred")
+          
+          d<-c(`Trait`=l,
+               `QTL`=gsub("_dat", "", i),
+               `Model`=gsub("p_", "", k),
+               `Training Size`=as.numeric(gsub("Training_","",gsub("%","",j))),
+               `Resistance Allele Effect`=fit$coefficients$fixed["QTL_pred_1",],
+               `QTL SE`=(sqrt(fit$vcoeff$fixed[5])/sqrt(n)),
+               `QTL Absent Estimated Mean`=p$pvals[p$pvals$QTL_pred==0,"predicted.value"],
+               `QTL Absent Estimated SE`=p$pvals[p$pvals$QTL_pred==0,"std.error"],
+               `QTL Present Estimated Mean`=p$pvals[p$pvals$QTL_pred==1,"predicted.value"],
+               `QTL Present Estimated SE`=p$pvals[p$pvals$QTL_pred==1,"std.error"],
+               `Wald Statistic`=q["QTL_pred","Wald statistic"],
+               `Sum of Sq`=q["QTL_pred","Sum of Sq"],
+               `Degrees of Freedom`=q["QTL_pred","Df"],
+               `P Value (Chisq)`=q["QTL_pred","Pr(Chisq)"])
+          
+          d<-as.data.frame(t(d))
+          
+          d<-d %>%
+            mutate(`Significance`=ifelse(q[2,4]<0.05 & q[2,4]>0.01 ,"*",
+                                     ifelse(q[2,4]<0.01 &q[2,4]>0.001,"**",
+                                            ifelse(q[2,4]<0.001,"***","NS"))))
+          
+          results<-rbind(results,d)
+          }
+        }
+      }
+    }
+  
+  #store all of those things in a list
+  list_of_list<-list("results_by_QTL"=results_by_QTL,
+                     "table_by_QTL"=table_by_QTL,
+                     "importance_by_QTL"=importance_by_QTL,
+                     "results_by_QTL_UFHBN"=results_by_QTL_UFHBN,
+                     "table_by_QTL_UFHBN"=table_by_QTL_UFHBN,
+                     "table_of_QTL_Effects"=results)
+    
+  return(list_of_list)
+}
+
+
+average_results<-function(predictions){
+  
+  #make objects to bind
+  a<-c()
+  b<-c()
+  c<-c()
+  d<-c()
+
+  #find your place in the list of list
+  for(i in names(predictions)){
+    for(j in names(predictions[[1]])){
+      
+      if(j==names(predictions[[1]])[1]){
+        
+        #do nothing with this data set, 
+        #too convoluted and not informative
+
+        print("passed 1")
+        
+      }else
+        if(j==names(predictions[[i]])[2]){
+          
+          for(k in names(predictions[[i]][[2]])){
+            aa<-predictions[[i]][[j]][[k]]
+            a<-rbind(a,aa)
+          }
+          
+          print("passed 2")
+          
+          }else
+            if(j==names(predictions[[i]])[3]){
+              
+              for(k in names(predictions[[i]][[3]])){
+                bb<-predictions[[i]][[j]][[k]]
+                bb<-bb %>%
+                  mutate(Trait=k) %>%
+                  select(Trait, everything())
+                for(l in c("N1A_dat_","JT1B_dat_", "N4A_dat_", "Fhb1_dat_")){
+                  colnames(bb)<-gsub(l,"",colnames(bb))
+                }
+                b<-rbind(b,bb)
+              }
+            
+              print("passed 3")
+          
+              }else
+                if(j==names(predictions[[i]])[4]){
+                
+                  #do nothing with this data set,
+                  #too convoluted and not informative
+                  
+                  print("passed 4")
+                  
+              }else
+                if(j==names(predictions[[i]])[5]){
+                  
+                            
+                  for(k in names(predictions[[i]][[5]])){
+                    cc<-predictions[[i]][[j]][[k]]
+                    c<-rbind(c,cc)
+                  }
+                        
+                  print("passed 5")
+                  
+                }else
+                  if(j==names(predictions[[i]])[6]){
+                  
+                    dd<-predictions[[i]][[j]]
+                    dd<-dd %>%
+                      select(-Significance)
+                    d<-rbind(d,dd)
+                    
+                    print("passed 6")
+                    
+                  }else{
+                    print("Ignoring 7")
+                  }
+    }
+  }
+  
+  
+  aa<-aggregate(.~Model + QTL + Training_Size, data = a, FUN = mean)
+  bb<-aggregate(.~Trait + Markers, data = b, FUN = mean)
+  cc<-aggregate(.~Model + QTL + Training_Size, data = c, FUN = mean)
+  d[,5:ncol(d)]<-lapply(d[,5:ncol(d)], as.numeric)
+  dd<-aggregate(.~Trait + Model + QTL + `Training Size`, data=d, FUN = mean)
+  
+  list_of_dfs<-list("Sunwheat QTL Raw Values"=a,
+                    "Sunwheat Marker Importance Raw Values"=b,
+                    "UFHBN QTL Raw Values"=c,
+                    "Marker Effects in UFHBN Raw Values"=d,
+                    "Summarization of SunWheat QTL Table"=aa,
+                    "Summarization of SunWheat Marker Importance"=bb,
+                    "Summarization of UFHBN QTL Table"=cc,
+                    "Summarization of Marker Effects in UFHBN Table"=dd)
+  
+  
+  return(list_of_dfs)
+  
+}
+
+#Set up number of permutations
+perms<-seq(from=1, to=30, by=1)
+
+#for testing
+#perms=1
+```
+
+### Run the Models and Average the Results
+
+Because I am randomly holding back percents of the population for forward validation, I need to replicate this many times. I will do this 30 times, and then average all of the results. 
+
+```{r}
+#create list of dataframes
+QTL<-list(
+  "N1A_dat"=N1A_dat,
+  "JT1B_dat"=JT1B_dat, 
+  "N4A_dat"=N4A_dat,
+  "Fhb1_dat"=Fhb1_dat
+          )
+
+predictions_2020<-list()
+
+for(i in perms){
+  print("****************************************")
+  print("****************************************")
+  print("****************************************")
+  if(i>9){
+    print(paste("********","Permutation Number =", i, "*******")) 
+  }else{
+    print(paste("********","Permutation Number =", i, "********"))
+  }
+  print("****************************************")
+  print("****************************************")
+  print("****************************************")
+  
+  predictions_2020[[paste("Permutation",i,sep="_")]]<-machine_models(QTL_obj = QTL, UFHBN_obj = UFHBN_fwd_valid, threshold = 100)
+}
+
+avg_2020<-average_results(predictions = predictions_2020)
+```
+
+# QTL Imputation in 2020
+
+Here, I run machine learning models to analyze the 2020 data and predict scab QTL.
+
+## Read in Data
+
+Here, I read in all the necessary data.
+
+### Read in 2020 GBS Data
+
+```{r}
+#read in marker data - this is the 2020-21 SNP file from May 2021
+#to read this file; this is the genotype data coded as 0, 1, 2
+Markers_2020 <- read.csv(file = "SG_May21_6392taxa_21324snp_012coding_060121.csv", 
+                    header = T, 
+                    row.names = 1, 
+                    check.names = F) 
+
+#header = T assigns column names, and row.names = 1 uses the first col in the data to assign row names
+#SNPs are down the side
+Markers_2020[1:5,1:5]
+
+#adjust the formatting on the FullSampleNames - there are a couple of odd underscores in here
+#change all underscores to dash
+colnames(Markers_2020) <- gsub("_", "-", colnames(Markers_2020)) 
+
+#change all to uppercase
+colnames(Markers_2020) <- toupper(colnames(Markers_2020)) 
+
+#shows 21234 SNPs and 6392 lines for SG
+dim(Markers_2020) 
+
+#transpose
+Markers_2020 <- as.data.frame(t(Markers_2020)) 
+
+#I need to parse these names for matching with the marker report
+Markers_2020 <- Markers_2020 %>% 
+  rownames_to_column(., var = "FullSampleName") %>% 
+  mutate(VarCode = FullSampleName) %>% 
+  separate(., VarCode, into = c("Nursery_Code", "LibPrepID", "Name"), sep = ":", extra = "merge")
+Markers_2020 <- separate(Markers_2020, Name, into = c("GSID", "Genotype"), sep = ":", extra = "drop", fill = "left")
+
+#remove all dashes, underscores, etc from the names in order to control for variation in the formatting
+Markers_2020 <- Markers_2020 %>% 
+  mutate(VAR2 = gsub("_|-", "", Genotype))
+
+#display matrix subset
+Markers_2020[1:5,1:5]
+
+#remove the junk left behind from formatting
+Markers_2020<-Markers_2020 %>%
+  select(-Nursery_Code, -LibPrepID, -GSID, -VAR2)
+
+#move genotype to front
+Markers_2020<-Markers_2020 %>%
+  select(FullSampleName, Genotype, everything())
+
+#make sure markers are numeric
+Markers_2020[,3:ncol(Markers_2020)]<-lapply(Markers_2020[,3:ncol(Markers_2020)], as.numeric)
+
+#list of genotypes and fullsamplenames
+var_list_2020 <- Markers_2020[,c("Genotype", "FullSampleName")]
+write.csv(var_list_2020, "SG21 Var List.csv", row.names = F)
+```
+
+### Reading in the eastern marker report for 2019 and 2021 for comparison to known data
+
+Here, we read in the marker reports from GBG's lab to use as our training population and to validate the model in our test population. 
+
+```{r}
+#this is the allele report for the KASP assays run on Sungrains in 2020-21
+comb_report <- read.csv("SG_2020_allele_report_FHB.csv",
+                     header = T, 
+                     check.names = F, 
+                     stringsAsFactors = F)
+
+#changing the OriginalSampleName to Genotype
+colnames(comb_report)[which(colnames(comb_report)=="OriginalSampleName")] <- "Genotype"
+
+#filter out duplicated genotypes
+comb_report <- comb_report %>% 
+  filter(!duplicated(Genotype))
+names(comb_report)
+
+#library
+library(knitr)
+
+#this combined report has data from Fhb1, 1A Neuse, 4A Neuse, and 1B Jamestown
+#here are tables reporting the frequencies of calls
+kable(table(comb_report$Fhb1), caption = "Calls for FHB1")
+kable(table(comb_report$Fhb_1B_Jamestown), caption = "Calls for 1B Jamestown")
+kable(table(comb_report$Fhb_1A_Neuse), caption = "Calls for 1A Neuse")
+kable(table(comb_report$Fhb_4A_Neuse), caption = "Calls for 4A Neuse")
+```
+
+## Data manipulation
+
+This section covers the manipulation of the data to fit R formats.
+
+### Transmute marker calls of reports
+
+Adjust some variables to make clear categories. We need to get rid of the different notations for ND, no call, NO CALL, etc. Also, go ahead and call the "?" ones as something. We can adjust this later if needed (maybe the "?" ones need to be NA?).   
+
+```{r}
+#Transmute FHB1
+comb_report <- comb_report %>% mutate(Fhb1 = ifelse(Fhb1 == "Fhb1?", "Fhb1",
+                                                        ifelse(Fhb1 == "Fhb1_het?", "Fhb1_het",
+                                                               ifelse(Fhb1 == "Fhb1_or_Fhb1_het", NA,
+                                                                      ifelse(Fhb1 == "ND", NA,
+                                                                        ifelse(Fhb1 == "NO CALL", NA, Fhb1)))))) %>%
+  mutate(Fhb1=ifelse(Fhb1=="Fhb1_het", NA, Fhb1))
+
+#Transmute 1B Jamestown
+comb_report <- comb_report %>% mutate(Fhb_1B_Jamestown = ifelse(Fhb_1B_Jamestown == "Fhb_1B_Jamestown_het?", "Fhb_1B_Jamestown_het",
+                                                        ifelse(Fhb_1B_Jamestown == "Fhb_1B_Jamestown_or_Fhb_1B_Jamestown_het", NA,
+                                                               ifelse(Fhb_1B_Jamestown == "Fhb_1B_Jamestown?", "Fhb_1B_Jamestown",
+                                                                    ifelse(Fhb_1B_Jamestown == "ND", NA,
+                                                                        ifelse(Fhb_1B_Jamestown == "", NA,   
+                                                                                ifelse(Fhb_1B_Jamestown == "no call", NA, Fhb_1B_Jamestown))))))) %>%
+  mutate(Fhb_1B_Jamestown=ifelse(Fhb_1B_Jamestown=="Fhb_1B_Jamestown_het", NA, Fhb_1B_Jamestown))
+
+
+#Transmute 1A Neuse
+comb_report <- comb_report %>% mutate(Fhb_1A_Neuse = ifelse(Fhb_1A_Neuse == "Fhb_1A_Neuse?", "Fhb_1A_Neuse",
+                                                        ifelse(Fhb_1A_Neuse == "Fhb1_1A_Neuse?", "Fhb_1A_Neuse",
+                                                           ifelse(Fhb_1A_Neuse == "Fhb_1A_Neuse_het?", "Fhb_1A_Neuse_het",
+                                                              ifelse(Fhb_1A_Neuse == "no call", NA,
+                                                                    ifelse(Fhb_1A_Neuse == "no_call", NA, 
+                                                                         ifelse(Fhb_1A_Neuse == "", NA,
+                                                                           ifelse(Fhb_1A_Neuse == "ND", NA, Fhb_1A_Neuse)))))))) %>%
+  mutate(Fhb_1A_Neuse=ifelse(Fhb_1A_Neuse=="Fhb_1A_Neuse_het", NA, Fhb_1A_Neuse))
+
+#Transmute 4A Neuse
+comb_report <- comb_report %>% mutate(Fhb_4A_Neuse = ifelse(Fhb_4A_Neuse == "Fhb_4A_Neuse?", "Fhb_4A_Neuse",
+                                                        ifelse(Fhb_4A_Neuse == "Fhb_4A_Neuse_het?", "Fhb_4A_Neuse_het",
+                                                           ifelse(Fhb_4A_Neuse == "Fhb_4A_Neuse_or_Fhb_4A_Neuse_het", NA,
+                                                              ifelse(Fhb_4A_Neuse == "no call", NA,
+                                                                    ifelse(Fhb_4A_Neuse == "no_call", NA, 
+                                                                         ifelse(Fhb_4A_Neuse == "", NA,
+                                                                           ifelse(Fhb_4A_Neuse == "ND", NA, Fhb_4A_Neuse)))))))) %>%
+  mutate(Fhb_4A_Neuse=ifelse(Fhb_4A_Neuse=="Fhb_4A_Neuse_het", NA, Fhb_4A_Neuse))
+
+### Made all ambiguous calls into NAs and all missing data or questions NAs###
+
+#I need to format the genotype names in the combined report
+#and make a list to match the report to the pheotypic/genotypic data
+comb_report$Genotype <- gsub("_", "-", comb_report$Genotype) 
+comb_report$Genotype <- toupper(comb_report$Genotype) 
+comb_report <- left_join(comb_report, var_list_2020, by = "Genotype")
+ 
+#select the data for the QTL we want
+comb_report <- comb_report %>% 
+  filter(FullSampleName %in% Markers_2020$FullSampleName) %>% 
+  filter(!duplicated(FullSampleName)) %>% 
+  select(FullSampleName, 
+         Genotype, 
+         Fhb1, 
+         Fhb_1B_Jamestown, 
+         Fhb_1A_Neuse,
+         Fhb_4A_Neuse)
+
+#remove names which occur in the combined report an UFHBN
+comb_report<- comb_report %>%
+  filter(!Genotype %in% Pheno_FHB$Genotype)
+
+#this combined report has data from Fhb1, 1A Neuse, 4A Neuse, and 1B Jamestown
+#here are tables reporting the frequencies of calls
+kable(table(comb_report$Fhb1), caption = "Calls for FHB1")
+kable(table(comb_report$Fhb_1B_Jamestown), caption = "Calls for 1B Jamestown")
+kable(table(comb_report$Fhb_1A_Neuse), caption = "Calls for 1A Neuse")
+kable(table(comb_report$Fhb_4A_Neuse), caption = "Calls for 4A Neuse")
+
+sg21_freq=data.frame(Population="sg21",
+                     Fhb1=table(comb_report$Fhb1)[1]/sum(table(comb_report$Fhb1)),
+                     "Qfhb.vt-1B"=table(comb_report$Fhb_1B_Jamestown)[1]/sum(table(comb_report$Fhb_1B_Jamestown)),
+                     "Qfhb.nc-1A"=table(comb_report$Fhb_1A_Neuse)[1]/sum(table(comb_report$Fhb_1A_Neuse)),
+                     "Qfhb.nc-4A"=table(comb_report$Fhb_4A_Neuse)[1]/sum(table(comb_report$Fhb_4A_Neuse)),
+                     check.names = F)
+```
+
+### Creating the data set(s)
+
+In the example I looked at, the data is phenotype then marker in the same data frame. I'm not able to pass in the entire set of SNPs (error in the run) so I am going to subset by chromosome here and then merge with phenotype data. **The phenotype data here is the KASP call data.**
+
+```{r}
+#get the genotype data for the chromosome of interest for FHB1
+genotype_3B <- select(Markers_2020, c(FullSampleName, contains("S3B"))) 
+genotype_3B[1:5, 1:5]
+
+#append phenotypic data (KASP calls) to genotypic data
+Fhb1_dat <- merge((comb_report %>% select(FullSampleName, Fhb1)), 
+                  genotype_3B, 
+                  by = "FullSampleName", 
+                  all.x = TRUE)
+
+#get rid of NAs and format factor
+Fhb1_dat <- Fhb1_dat[complete.cases(Fhb1_dat),] 
+Fhb1_dat$Fhb1 <- as.factor(Fhb1_dat$Fhb1)
+
+### Repeat this process for the other QTL ###
+
+#Jamestown 1B
+genotype_1B <- select(Markers_2020, c(FullSampleName, contains("S1B"))) #get the genotype data for the chromosome of interest
+genotype_1B[1:5, 1:5]
+
+JT1B_dat <- merge((comb_report %>% select(FullSampleName, Fhb_1B_Jamestown)), 
+                  genotype_1B, 
+                  by = "FullSampleName", 
+                  all.x = TRUE)
+
+JT1B_dat <- JT1B_dat[complete.cases(JT1B_dat),] #get rid of any missing data from this merge
+JT1B_dat$Fhb_1B_Jamestown <- as.factor(JT1B_dat$Fhb_1B_Jamestown) #needs to be a factor
+
+#Neuse 1A
+genotype_1A <- select(Markers_2020, c(FullSampleName, contains("S1A"))) #get the genotype data for the chromosome of interest
+genotype_1A[1:5, 1:5]
+
+N1A_dat <- merge((comb_report %>% select(FullSampleName, Fhb_1A_Neuse)), 
+                 genotype_1A, 
+                 by = "FullSampleName", 
+                 all.x = TRUE)
+
+N1A_dat <- N1A_dat[complete.cases(N1A_dat),] #get rid of any missing data from this merge
+N1A_dat$Fhb_1A_Neuse <- as.factor(N1A_dat$Fhb_1A_Neuse) #needs to be a factor
+
+#Neuse 4A
+genotype_4A <- select(Markers_2020, c(FullSampleName, contains("S4A"))) #get the genotype data for the chromosome of interest
+genotype_4A[1:5, 1:5]
+
+N4A_dat <- merge((comb_report %>% select(FullSampleName, Fhb_4A_Neuse)), 
+                 genotype_4A, 
+                 by = "FullSampleName", 
+                 all.x = TRUE)
+
+N4A_dat <- N4A_dat[complete.cases(N4A_dat),] #get rid of any missing data from this merge
+N4A_dat$Fhb_4A_Neuse <- as.factor(N4A_dat$Fhb_4A_Neuse) #needs to be a factor
+```
+
+### Merge KASP calls to data
+
+Here I bind together the lines that have GBS data, KASP data, and phenotypic data to use later. 
+
+```{r}
+dat<-Pheno_FHB %>%
+  select(1,2,4,SEV,FDK,DON,HeadDate,PlantHt,QTL_1A,JT_1B,QTL_4A,Fhb1) %>%
+  rename(N1A=QTL_1A) %>%
+  rename(N4A=QTL_4A) %>%
+  rename(JT1B=JT_1B) %>%
+  mutate(Fhb1=ifelse(Fhb1==1,"Fhb1",
+                     ifelse(Fhb1==0, "no", NA))) %>%
+  mutate(N1A=ifelse(N1A==1,"Fhb_1A_Neuse",
+                     ifelse(N1A==0, "no", NA))) %>%
+  mutate(N4A=ifelse(N4A==1,"Fhb_4A_Neuse",
+                     ifelse(N4A==0, "no", NA))) %>%
+  mutate(JT1B=ifelse(JT1B==1,"Fhb_1B_Jamestown",
+                     ifelse(JT1B==0, "no", NA))) 
+
+#create GRM
+g<-as.data.frame(Markers_2020[Markers_2020$FullSampleName %in% dat$FullSampleName,])
+rownames(g)=NULL
+g<-column_to_rownames(g,var = "FullSampleName")
+g<-g[,-1]
+g<-as.matrix(g)
+pca<-prcomp(g)
+sum_pca<-summary(pca)
+sum_pca$importance[,1:4]
+pca<-as.data.frame(pca$x)[,1:3]
+pca<-rownames_to_column(pca, var="FullSampleName")
+
+#only select data that has the PCs
+dat<-dat[dat$FullSampleName %in% rownames(g),]
+
+#merge in PCs
+dat<-left_join(dat, pca, by="FullSampleName")
+
+#results object
+results<-c()
+
+#Run Models
+for(i in c("SEV","FDK","DON","HeadDate","PlantHt")){
+  for(j in c("Fhb1", "N1A", "N4A", "JT1B")){
+    print(paste("Analyzing", j, "for", i))
+    
+    a<-dat %>%
+      drop_na(all_of(j)) %>%
+      drop_na(all_of(i)) %>%
+      select(Genotype, FullSampleName, Env, PC1, PC2, PC3, all_of(j), all_of(i)) %>%
+      drop_na()
+    
+    a<-a %>%
+      filter(FullSampleName %in% rownames(g))
+    
+    colnames(a)[ncol(a)-1]<-"QTL"
+    colnames(a)[ncol(a)]<-"Y"
+    a[,"QTL"]<-ifelse(a[,"QTL"]=="no",0, 1)
+    a[,1:3]<-lapply(a[,1:3], as.factor)
+    a[,"QTL"]<-as.factor(a[,"QTL"])
+
+    fit<-asreml(fixed = Y~QTL+PC1+PC2+PC3,
+                random = ~idv(FullSampleName)+idv(Env),
+                residual = ~idv(units),
+                data = a)
+    
+    n=as.numeric(nrow(filter(a, QTL==1)))
+
+    q<-wald(fit)
+    p<-predict(fit, classify = "QTL")
+    d<-c(`Trait`=i,
+         `QTL`=j,
+         `Resistance Allele Effect`=fit$coefficients$fixed["QTL_1",],
+         `QTL SE`=(sqrt(fit$vcoeff$fixed[5])/sqrt(n)),
+         `QTL Present Estimated Mean`=p$pvals[p$pvals$QTL==1,"predicted.value"],
+         `QTL Present Estimated SE`=p$pvals[p$pvals$QTL==1,"std.error"],
+         `QTL Absent Estimated Mean`=p$pvals[p$pvals$QTL==0,"predicted.value"],
+         `QTL Absent Estimated SE`=p$pvals[p$pvals$QTL==0,"std.error"],
+         `Wald Statistic`=q[rownames(q)=="QTL","Wald statistic"],
+         `Sum of Sq`=q[rownames(q)=="QTL","Sum of Sq"],
+         `Degrees of Freedom`=q[rownames(q)=="QTL","Df"],
+         `P Value (Chisq)`=q[rownames(q)=="QTL","Pr(Chisq)"])
+    d<-as.data.frame(t(d))
+    results<-rbind(results,d)
+    remove(q,p,a,d)
+    }
+}
+
+#make object
+results<-as.data.frame(results)
+results<-results[order(results$QTL, results$Trait), ]
+
+#write out raw results
+write.csv(results,"Single_Marker_Analysis_for_UFHBN_Observed_2021.csv", row.names = F)
+
+#make list to pull names of eligible lines for forward validation
+UFHBN_fwd_valid<-list()
+
+#single marker regression and preparing for forward validation
+for(i in c("N1A","JT1B", "N4A", "Fhb1")){
+  if(i=="N1A"){
+    a<-dat %>%
+      select(FullSampleName, Genotype, Env ,all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+      drop_na(all_of(i))
+    b<-Markers_2020[,c("FullSampleName",colnames(Markers_2020)[grep("1A",colnames(Markers_2020))])]
+    a<-left_join(a,b, by="FullSampleName")
+    z=paste(i,"_dat",sep="")
+    UFHBN_fwd_valid[[z]]<-a
+    remove(a,b,z)
+  }else
+    if(i=="JT1B"){
+      a<-dat %>%
+        select(FullSampleName, Genotype, Env, all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+        drop_na(all_of(i))
+      b<-Markers_2020[,c("FullSampleName",colnames(Markers_2020)[grep("1B",colnames(Markers_2020))])]
+      a<-left_join(a,b, by="FullSampleName")
+      z=paste(i,"_dat",sep="")
+      UFHBN_fwd_valid[[z]]<-a
+      remove(a,b,z)
+    }else
+      if(i=="N4A"){
+        a<-dat %>%
+          select(FullSampleName, Genotype, Env, all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+          drop_na(all_of(i))
+        b<-Markers_2020[,c("FullSampleName",colnames(Markers_2020)[grep("4A",colnames(Markers_2020))])]
+        a<-left_join(a,b, by="FullSampleName")
+        z=paste(i,"_dat",sep="")
+        UFHBN_fwd_valid[[z]]<-a
+        remove(a,b,z)
+      }else
+        if(i=="Fhb1"){
+          a<-dat %>%
+            select(FullSampleName, Genotype, Env, all_of(i), PC1, PC2, PC3, SEV, FDK, DON, HeadDate, PlantHt) %>%
+            drop_na(all_of(i))
+          b<-Markers_2020[,c("FullSampleName",colnames(Markers_2020)[grep("3B",colnames(Markers_2020))])]
+          a<-left_join(a,b, by="FullSampleName")
+          z=paste(i,"_dat",sep="")
+          UFHBN_fwd_valid[[z]]<-a
+          remove(a,b,z) 
+        }else{
+          print(paste("Something is wrong with", i, "check loop."))
+        }
+}
+```
+
+### Run the Models and Average the Results
+
+Because I am randomly holding back percents of the population for forward validation, I need to replicate this many times. I will do this 20 times, and then average all of the results. 
+
+```{r}
+#create list of dataframes
+QTL<-list(
+  "N1A_dat"=N1A_dat,
+  "JT1B_dat"=JT1B_dat, 
+  "N4A_dat"=N4A_dat,
+  "Fhb1_dat"=Fhb1_dat
+          )
+
+predictions_2021<-list()
+
+for(i in perms){
+  print("****************************************")
+  print("****************************************")
+  print("****************************************")
+  if(i>9){
+    print(paste("********","Permutation Number =", i, "*******")) 
+  }else{
+    print(paste("********","Permutation Number =", i, "********"))
+  }
+  print("****************************************")
+  print("****************************************")
+  print("****************************************")
+  
+  predictions_2021[[paste("Permutation",i,sep="_")]]<-machine_models(QTL_obj = QTL, 
+                                                                     UFHBN_obj = UFHBN_fwd_valid, 
+                                                                     threshold = 100 )
+}
+
+avg_2021<-average_results(predictions = predictions_2021)
+```
+
+
+#### Save Environment
+
+```{r}
+t2=rbind(sg20_freq, sg21_freq, UFHB_freq)
+write.csv(t2, "Table_of_freq.csv", row.names = F)
+a<-Sys.Date()
+a<-gsub("-","_",a)
+save.image(paste("final_workspace_", a,".ENV.RData",sep = ""))
+```
