@@ -1,4 +1,4 @@
-# Prediction-of-FHB-Resistance-QTL-Haplotypes-Through-Molecular-Markers-GBS-and-ML
+# Profiling of Fusarium Head Blight Resistance QTL Haplotypes Through Molecular Markers, Genotyping-by-Sequencing, and Machine Learning
 This is the data repository for the publication of the same name.
 
 In this data repository, I will only be placing the R code and the resulting output. 
